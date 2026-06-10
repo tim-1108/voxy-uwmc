@@ -24,6 +24,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.CardinalLighting;
 import net.minecraft.world.level.ColorResolver;
 import net.minecraft.world.level.LightLayer;
@@ -159,33 +160,21 @@ public class ModelFactory {
         if (this.idMappings[blockId] != -1) {
             return false;
         }
-        //We are (probably) going to be baking the block id
-        // check that it is currently not inflight, if it is, return as its already being baked
-        // else add it to the flight as it is going to be baked
-        this.blockStatesInFlightLock.lock();
-        if (!this.blockStatesInFlight.add(blockId)) {
-            this.blockStatesInFlightLock.unlock();
-            //Block baking is already in-flight
-            return false;
-        }
-        this.blockStatesInFlightLock.unlock();
 
-        VarHandle.loadLoadFence();
 
-        //We need to get it twice cause of threading
-        if (this.idMappings[blockId] != -1) {
-            return false;
-        }
 
         var blockState = this.mapper.getBlockStateFromBlockId(blockId);
-
         if (blockState.getBlock() instanceof StairBlock sb) {
-            if (sb.baseState.hasProperty(BlockStateProperties.WATERLOGGED)) {
-                blockState = sb.baseState.setValue(BlockStateProperties.WATERLOGGED, blockState.getValue(BlockStateProperties.WATERLOGGED));
-            } else {
-                blockState = sb.baseState;
-            }
+                /*
+                if (sb.baseState.hasProperty(BlockStateProperties.WATERLOGGED)) {
+                    blockState = sb.baseState.setValue(BlockStateProperties.WATERLOGGED, blockState.getValue(BlockStateProperties.WATERLOGGED));
+                } else {
+                    blockState = sb.baseState;
+                }*/
+            blockState = sb.baseState.getBlock().withPropertiesOf(blockState);
         }
+
+        //We do this first so that it is always guarenteed that fluid models are ordered before the block models
 
         //Before we enqueue the baking of this blockstate, we must check if it has a fluid state associated with it
         // if it does, we must ensure that it is (effectivly) baked BEFORE we bake this blockstate
@@ -204,8 +193,32 @@ public class ModelFactory {
                 addEntry(fluidStateId);
             }
         }
-        this.bakeQueue.add(new BlockBake(blockId, blockState));
-        return true;
+
+        //We are (probably) going to be baking the block id
+        // check that it is currently not inflight, if it is, return as its already being baked
+        // else add it to the flight as it is going to be baked
+        this.blockStatesInFlightLock.lock();
+        try {
+            if (!this.blockStatesInFlight.add(blockId)) {
+                //Block baking is already in-flight
+                return false;
+            }
+
+            VarHandle.loadLoadFence();
+
+            //We must do this in here as otherwise there is a race condition, the order in which blocks are added to the
+            // blockStatesInFlight must be the the oder they are added to the bake queue
+
+            //We need to get it twice cause of threading
+            if (this.idMappings[blockId] != -1) {
+                return false;
+            }
+            this.bakeQueue.add(new BlockBake(blockId, blockState));
+            return true;
+
+        } finally {
+            this.blockStatesInFlightLock.unlock();
+        }
     }
 
     private boolean processModelResult() {
@@ -214,18 +227,6 @@ public class ModelFactory {
         ColourDepthTextureData[] textureData = new ColourDepthTextureData[6];
 
         int flags = this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer);
-
-        boolean hasDarkenedTextures = (flags&2)!=0;
-        boolean isShaded = (flags&1)!=0;
-        ChunkSectionLayer layer = ChunkSectionLayer.SOLID;
-        if ((flags&4)!=0) {
-            layer = ChunkSectionLayer.TRANSLUCENT;
-        } else if ((flags&8)!=0) {
-            layer = ChunkSectionLayer.CUTOUT;
-        }
-        if (bake.state.is(BlockTags.LEAVES)) {
-            layer = ChunkSectionLayer.SOLID;
-        }
 
 
         {//Create texture data
@@ -251,6 +252,45 @@ public class ModelFactory {
             }
         }
 
+
+        boolean hasDarkenedTextures = (flags&2)!=0;
+        boolean isShaded = (flags&1)!=0;
+        ChunkSectionLayer layer = null;
+        if (layer==null && (flags&4)!=0) {
+            //we do an extra check here to be sure texture is translucent
+
+            //TODO: check this is right
+            boolean anyTranslucent = false;
+            for (var face : textureData) {
+                anyTranslucent|=TextureUtils.hasTranslucentPixel(face);
+                if (anyTranslucent) break;
+            }
+            if (anyTranslucent) {
+                layer = ChunkSectionLayer.TRANSLUCENT;
+            } else {
+                boolean solid = true;
+                for (var face : textureData) {
+                    solid&=TextureUtils.isSolidWhereDrawn(face);
+                    if (!solid) break;
+                }
+                if (solid) {
+                    layer = ChunkSectionLayer.SOLID;
+                } else {
+                    layer = ChunkSectionLayer.CUTOUT;
+                }
+            }
+        }
+        if (layer==null && (flags&8)!=0) {
+            layer = ChunkSectionLayer.CUTOUT;
+        }
+        if (bake.state.is(BlockTags.LEAVES)) {
+            layer = ChunkSectionLayer.SOLID;
+        }
+        if (layer == null) {
+            layer = ChunkSectionLayer.SOLID;
+        }
+
+
         var bakeResult = this.processTextureBakeResult(bake.blockId, bake.state, textureData, isShaded, hasDarkenedTextures, layer);
         if (bakeResult!=null) {
             this.uploadResults.add(bakeResult);
@@ -263,13 +303,13 @@ public class ModelFactory {
         this.biomeQueue.add(biome);
     }
 
-    public void processAllThings() {
+    public boolean processAllThings() {
         var biomeEntry = this.biomeQueue.poll();
         while (biomeEntry != null) {
             var biomeRegistry = Minecraft.getInstance().level.registryAccess().lookupOrThrow(Registries.BIOME);
             var mcbiomeEntry = biomeRegistry.get(Identifier.parse(biomeEntry.biome));
             if (!mcbiomeEntry.isPresent()) {
-                Logger.error("Could not find biome: " + biomeEntry.biome + " using default");
+                Logger.warn("Could not find biome: " + biomeEntry.biome + " using default");
             }
             var res = this.addBiome0(biomeEntry.id, mcbiomeEntry.isPresent()?mcbiomeEntry.orElseThrow().value():DEFAULT_BIOME);
             if (res != null) {
@@ -279,6 +319,7 @@ public class ModelFactory {
         }
 
         while (this.processModelResult());
+        return (this.blockStatesInFlight.size()!=0)||(!this.bakeQueue.isEmpty())||!this.biomeQueue.isEmpty();
     }
 
     public void processUploads() {
@@ -580,6 +621,9 @@ public class ModelFactory {
         boolean canBeCorrectlyRendered = true;//This represents if a model can be correctly (perfectly) represented
         // i.e. no gaps
 
+        //block emission
+        metadata |= ((long)getBlockLightEmission(blockState))<<(48+7);
+
         this.metadataCache[modelId] = metadata;
 
         uploadPtr += 4*6;
@@ -603,16 +647,17 @@ public class ModelFactory {
             MemoryUtil.memPutInt(uploadPtr, -1);//Set the default to nothing so that its faster on the gpu
         } else if (!isBiomeColourDependent) {
             MemoryUtil.memPutInt(uploadPtr, entry.tintingColour);
-        } else if (!this.biomes.isEmpty()) {
+        } else {
             //Populate the list of biomes for the model state
             int biomeIndex = this.modelsRequiringBiomeColours.size() * this.biomes.size();
             MemoryUtil.memPutInt(uploadPtr, biomeIndex);
             this.modelsRequiringBiomeColours.add(new Pair<>(modelId, blockState));
-
-            uploadResult.biomeUploadIndex = biomeIndex;
-            long clrUploadPtr = (uploadResult.biomeUpload = new MemoryBuffer(4L * this.biomes.size())).address;
-            for (var biome : this.biomes) {
-                MemoryUtil.memPutInt(clrUploadPtr, captureColourConstant(tintSources, blockState, biome)|0xFF000000); clrUploadPtr += 4;
+            if (!this.biomes.isEmpty()) {
+                uploadResult.biomeUploadIndex = biomeIndex;
+                long clrUploadPtr = (uploadResult.biomeUpload = new MemoryBuffer(4L * this.biomes.size())).address;
+                for (var biome : this.biomes) {
+                    MemoryUtil.memPutInt(clrUploadPtr, captureColourConstant(tintSources, blockState, biome) | 0xFF000000); clrUploadPtr += 4;
+                }
             }
         }
         uploadPtr += 4;
@@ -648,6 +693,39 @@ public class ModelFactory {
         this.blockStatesInFlightLock.unlock();
 
         return uploadResult;
+    }
+
+    private static int getBlockLightEmission(BlockState state) {
+        boolean isEmissive = state.emissiveRendering(new BlockGetter() {
+            @Override
+            public @org.jspecify.annotations.Nullable BlockEntity getBlockEntity(BlockPos pos) {
+                return null;
+            }
+
+            @Override
+            public BlockState getBlockState(BlockPos pos) {
+                return state;
+            }
+
+            @Override
+            public FluidState getFluidState(BlockPos pos) {
+                return state.getFluidState();
+            }
+
+            @Override
+            public int getHeight() {
+                return 0;
+            }
+
+            @Override
+            public int getMinY() {
+                return 0;
+            }
+        }, BlockPos.ZERO);
+        if (isEmissive) {
+            return 15;//full bright
+        }
+        return Math.clamp(state.getLightEmission(),0,15);
     }
 
     private static final class BiomeUploadResult implements ResultUploader {
